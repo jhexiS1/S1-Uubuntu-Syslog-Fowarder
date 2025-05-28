@@ -1,86 +1,129 @@
-#!/bin/bash
-
+#!/usr/bin/env bash
 # sentinelone_syslog_ng_multi_source_setup.sh
 # Version: Ubuntu Edition
-# Author: Adapted for Ubuntu by PurpleOne GPT
-# Description: Automates setup of syslog-ng on Ubuntu to forward logs from multiple sources to SentinelOne
+# Author: Adapted by ChatGPT
+# Description: Automates installation and configuration of syslog-ng on Ubuntu
+#              to forward logs from multiple source IP groups to a SentinelOne HTTP ingestion endpoint.
 
-set -e
+set -euo pipefail
+
+# Ensure running as root
+if [[ $EUID -ne 0 ]]; then
+  echo "[ERROR] This script must be run as root." >&2
+  exit 1
+fi
 
 echo "=== SentinelOne Syslog-ng Multi-Source Setup (Ubuntu) ==="
 
-# --- Step 1: System Preparation ---
-echo "[INFO] Updating system and installing dependencies..."
-sudo apt update
-sudo apt install -y syslog-ng-core syslog-ng-mod-http util-linux
-
-# Remove rsyslog if it's installed to avoid conflict with syslog-ng
-if dpkg -l | grep -q rsyslog; then
-  echo "[INFO] Removing rsyslog to prevent conflict..."
-  sudo apt remove -y rsyslog
+# Prompt for ingestion endpoint
+read -p "Enter SentinelOne HTTP ingestion endpoint (full URL): " ingest_endpoint
+if [[ -z "$ingest_endpoint" ]]; then
+  echo "[ERROR] Ingestion endpoint cannot be empty." >&2
+  exit 1
 fi
 
-# --- Step 2: Firewall Configuration ---
-echo "[INFO] Configuring firewall to allow syslog ports..."
-sudo ufw allow 514/udp
-sudo ufw allow 5514/tcp
-sudo ufw reload
+# Install dependencies
+echo "[INFO] Installing packages..."
+apt update
+apt install -y syslog-ng-core syslog-ng-mod-http util-linux
 
-# --- Step 3: Interactive Configuration for Log Sources ---
-echo "[INFO] Starting interactive setup for log source groups..."
-read -p "Enter number of log source groups to configure: " group_count
+# Configure firewall
+if command -v ufw &> /dev/null; then
+  echo "[INFO] Configuring UFW rules..."
+  ufw allow 514/udp
+  ufw allow 5514/tcp
+  ufw reload
+else
+  echo "[WARN] UFW not found; open ports 514/udp and 5514/tcp manually." >&2
+fi
 
-config_blocks=()
+# Prompt for number of source groups
+read -p "Enter number of source groups: " group_count
+if ! [[ "$group_count" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[ERROR] Invalid number of groups." >&2
+  exit 1
+fi
 
-for ((i=1; i<=group_count; i++)); do
-  echo "--- Configuring group #$i ---"
-  read -p "  Group Name (no spaces): " group_name
-  read -p "  Source IPs or CIDRs (space-separated): " group_ips
-  read -sp "  SentinelOne API Key: " api_key
-  echo
-  read -p "  SentinelOne Sourcetype (parser name): " sourcetype
+declare -a config_blocks
+for i in $(seq 1 "$group_count"); do
+  echo "---- Configuring group #$i ----"
+  while true; do
+    read -p "Group name (alphanumeric & underscores only): " group_name
+    if [[ "$group_name" =~ ^[A-Za-z0-9_]+$ ]]; then
+      break
+    else
+      echo "[ERROR] Invalid group name." >&2
+    fi
+  done
 
-  config_blocks+=("
-destination d_$group_name {
-  http(
-    url(\"https://ingest.us1.sentinelone.net/services/collector/raw?sourcetype=$sourcetype\")
-    headers(\"Authorization: $api_key\")
-    method(\"POST\")
-    body-mode(\"json\")
-  );
+  read -p "Enter comma-separated IPs/CIDRs for $group_name: " ip_list
+  IFS=',' read -r -a ips <<< "$ip_list"
+  filter_expr="or("
+  for cidr in "${ips[@]}"; do
+    filter_expr+=" netmask(\"${cidr}\");"
+  done
+  filter_expr+=" )"
+
+  read -s -p "SentinelOne API key for $group_name: " api_key; echo ""
+  if [[ -z "$api_key" ]]; then
+    echo "[ERROR] API key cannot be empty." >&2
+    exit 1
+  fi
+
+  read -p "Enter sourcetype/parser for $group_name: " parser_name
+  if [[ -z "$parser_name" ]]; then
+    echo "[ERROR] Sourcetype cannot be empty." >&2
+    exit 1
+  fi
+
+  config_blocks+=( "filter f_${group_name} {
+    ${filter_expr};
 };
 
-filter f_$group_name {
-  netmask(\"$group_ips\");
+source s_${group_name} {
+    syslog(ip(0.0.0.0) port(514) transport(\"udp\"));
+};
+
+destination d_${group_name} {
+    http(
+        url(\"${ingest_endpoint}\")
+        method(\"POST\")
+        headers(
+            \"Authorization: ApiKey ${api_key}\"
+            \"Content-Type: application/json\"
+            \"X-Sourcetype: ${parser_name}\"
+        )
+        body(\"%MESSAGE%\")
+        tls(peer-verify(optional-trust))
+    );
 };
 
 log {
-  source(s_net);
-  filter(f_$group_name);
-  destination(d_$group_name);
-  flags(final);
-};")
+    source(s_${group_name});
+    filter(f_${group_name});
+    destination(d_${group_name});
+};" )
 done
 
-# --- Step 4: syslog-ng Configuration File ---
-echo "[INFO] Generating syslog-ng configuration..."
-sudo tee /etc/syslog-ng/conf.d/sentinelone_multi_source.conf > /dev/null <<EOF
+conf_file="/etc/syslog-ng/conf.d/sentinelone_multi_source.conf"
+if [[ -f "$conf_file" ]]; then
+  cp "$conf_file" "${conf_file}.bak.$(date +%s)"
+  echo "[INFO] Backed up existing config."
+fi
+
+cat > "$conf_file" <<EOF
 @version: 3.36
 @include "scl.conf"
 
-source s_net {
-  network(ip(\"0.0.0.0\") port(514) transport(\"udp\"));
-  network(ip(\"0.0.0.0\") port(5514) transport(\"tcp\"));
-};
+$(printf "%s
 
-$(printf "%s\n\n" "${config_blocks[@]}")
+" "${config_blocks[@]}")
 EOF
 
-# --- Step 5: Restart syslog-ng ---
-echo "[INFO] Restarting syslog-ng service..."
-sudo systemctl restart syslog-ng
-sudo systemctl enable syslog-ng
+echo "[INFO] Restarting syslog-ng..."
+systemctl restart syslog-ng
+systemctl enable syslog-ng
 
-# --- Final Step ---
-echo "[DONE] Setup complete. Syslog-ng is now configured to forward logs to SentinelOne."
-echo "Check /var/log/syslog or /var/log/syslog-ng for troubleshooting if needed."
+echo "[DONE] Setup complete."
+echo "Validate: sudo syslog-ng --syntax-only"
+echo "Logs: sudo journalctl -u syslog-ng -f"

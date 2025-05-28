@@ -1,76 +1,92 @@
 # SentinelOne Syslog-NG Multi-Source Setup (Ubuntu)
 
 ## Overview
-This project provides a shell script to automate the configuration of an Ubuntu-based syslog-ng server. The server collects logs from multiple sources and forwards them to SentinelOne's ingestion endpoint using different API keys and parsers per source group.
+Automates installation and configuration of syslog-ng on Ubuntu to forward logs 
+from multiple source IP groups to a SentinelOne HTTP ingestion endpoint.
 
-## Features
-- Automatically installs required packages and removes conflicting ones.
-- Configures firewall rules to allow syslog traffic on UDP 514 and TCP 5514.
-- Prompts user to define multiple source groups with:
-  - Group name
-  - IP ranges
-  - SentinelOne API key (secure input)
-  - SentinelOne sourcetype (parser name)
-- Generates `/etc/syslog-ng/conf.d/sentinelone_multi_source.conf` dynamically.
-- Restarts and enables syslog-ng service.
+## Prerequisites
+- Ubuntu 20.04+  
+- syslog-ng ≥ 3.36  
+- Root (sudo) access  
 
-## Requirements
-- Ubuntu server with internet access.
-- `sudo` or root privileges.
-- Knowledge of source IP ranges and corresponding SentinelOne API keys & sourcetypes.
+## Installation
 
-## Usage
-1. **Clone the Repository**
-   ```bash
-   git clone https://github.com/your-org/sentinelone-syslog-ng-setup.git
-   cd sentinelone-syslog-ng-setup
-   ```
+```bash
+git clone https://github.com/jhexiS1/S1-Uubuntu-Syslog-Fowarder.git
+cd S1-Uubuntu-Syslog-Fowarder
+chmod +x sentinelone_syslog_ng_multi_source_setup.sh
+sudo ./sentinelone_syslog_ng_multi_source_setup.sh
+```
 
-2. **Make Script Executable**
-   ```bash
-   chmod +x sentinelone_syslog_ng_multi_source_setup.sh
-   ```
+The script will prompt you for:
+- **Ingestion endpoint** (full HTTP URL)  
+- **Number of source groups**  
+- **Group names**  
+- **IPs/CIDRs**  
+- **SentinelOne API keys**  
+- **Sourcetype/parser names**
 
-3. **Run the Script**
-   ```bash
-   ./sentinelone_syslog_ng_multi_source_setup.sh
-   ```
+It backs up any existing `/etc/syslog-ng/conf.d/sentinelone_multi_source.conf`.
 
-4. **Follow Prompts**
-   - Enter number of log groups.
-   - For each group, provide:
-     - Group name (e.g., "firewalls")
-     - Space-separated IPs or CIDRs
-     - API key (hidden input)
-     - Sourcetype (e.g., `s_palo_5514`, `s_syslog`)
+## Firewall
+- With UFW: opens UDP 514 and TCP 5514 automatically  
+- Without UFW: open these ports manually  
 
-5. **Verify and Monitor**
-   - Check `/etc/syslog-ng/conf.d/sentinelone_multi_source.conf`.
-   - Logs are typically found in `/var/log/syslog` or `/var/log/syslog-ng`.
+## Validation & Troubleshooting
 
-## Example Scenario
-- Group `firewalls`: IPs `192.168.1.0/24`, API key `XXXX`, sourcetype `s_palo_5514`
-- Group `local-logs`: IPs `127.0.0.1`, API key `YYYY`, sourcetype `s_syslog`
-
-## Security Notice
-- API keys are entered securely (not shown on screen).
-- This script should be executed in a secure environment.
-
-## Troubleshooting
-- Ensure syslog-ng is running:
+- **Syntax check**  
   ```bash
-  systemctl status syslog-ng
+  sudo syslog-ng --syntax-only
   ```
-- Check logs:
+- **Live logs**  
   ```bash
-  tail -f /var/log/syslog
+  sudo journalctl -u syslog-ng -f
   ```
+- **Install HTTP module**  
+  ```bash
+  sudo apt install syslog-ng-mod-http
+  ```
+
+## Example Snippet
+
+```conf
+@version: 3.36
+@include "scl.conf"
+
+filter f_example {
+  or(
+    netmask("10.0.0.0/8");
+    netmask("192.168.1.0/24");
+  );
+};
+
+source s_example {
+  syslog(ip(0.0.0.0) port(514) transport("udp"));
+};
+
+destination d_example {
+    http(
+        url("${ingest_endpoint}")
+        method("POST")
+        headers(
+            "Authorization: ApiKey ${api_key}"
+            "Content-Type: application/json"
+            "X-Sourcetype: example"
+        )
+        body("%MESSAGE%")
+        tls(peer-verify(optional-trust))
+    );
+};
+
+log {
+    source(s_example);
+    filter(f_example);
+    destination(d_example);
+};
+```
+
+## Support
+Open a GitHub issue for questions.
 
 ## License
-MIT or as applicable to your organization's policy.
-
-## Maintainers
-Your team or organization contact details.
-
----
-*Built for Ubuntu servers with ❤️ by PurpleOne GPT.*
+MIT
