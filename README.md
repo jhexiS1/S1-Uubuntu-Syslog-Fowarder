@@ -1,13 +1,14 @@
 # SentinelOne Syslog-NG Multi-Source Setup (Ubuntu)
 
 ## Overview
-Automates installation and configuration of syslog-ng on Ubuntu to forward logs 
-from multiple source IP groups to a SentinelOne HTTP ingestion endpoint.
+This script installs and configures **syslog-ng OSE** on Ubuntu (20.04+),  
+allowing you to forward logs from multiple source groups—each on its own UDP port—  
+to a SentinelOne HTTP ingestion endpoint.
 
 ## Prerequisites
-- Ubuntu 20.04+  
-- syslog-ng ≥ 3.36  
-- Root (sudo) access  
+- Ubuntu **20.04** or **22.04**  
+- **Root** (sudo) access  
+- Internet access for repository and package installs  
 
 ## Installation
 
@@ -18,19 +19,21 @@ chmod +x sentinelone_syslog_ng_multi_source_setup.sh
 sudo ./sentinelone_syslog_ng_multi_source_setup.sh
 ```
 
-The script will prompt you for:
-- **Ingestion endpoint** (full HTTP URL)  
-- **Number of source groups**  
-- **Group names**  
-- **IPs/CIDRs**  
-- **SentinelOne API keys**  
-- **Sourcetype/parser names**
+### What You’ll Be Asked
+1. **Ingestion endpoint**: Full HTTP URL provided by SentinelOne.  
+2. **Number of source groups**: Positive integer.  
+3. For each group:  
+   - **Name** (alphanumeric + underscores)  
+   - **Unique UDP port** (1–65535)  
+   - **IPs/CIDRs** (comma-separated; e.g. `10.0.0.0/8,192.168.1.0/24`)  
+   - **SentinelOne API key**  
+   - **Sourcetype/parser name**  
 
-It backs up any existing `/etc/syslog-ng/conf.d/sentinelone_multi_source.conf`.
+The script backs up any existing `/etc/syslog-ng/conf.d/sentinelone_multi_source.conf`.
 
-## Firewall
-- With UFW: opens UDP 514 and TCP 5514 automatically  
-- Without UFW: open these ports manually  
+## Firewall Configuration
+- If **UFW** is installed, the script will open each user-selected UDP port **plus** TCP 5514 (console) automatically.  
+- If **UFW** is not present, you must manually open those ports.
 
 ## Validation & Troubleshooting
 
@@ -38,55 +41,47 @@ It backs up any existing `/etc/syslog-ng/conf.d/sentinelone_multi_source.conf`.
   ```bash
   sudo syslog-ng --syntax-only
   ```
-- **Live logs**  
+- **Restart/logs**  
   ```bash
+  sudo systemctl restart syslog-ng
   sudo journalctl -u syslog-ng -f
   ```
-- **Install HTTP module**  
+- **Missing `mod-http` errors**  
   ```bash
-  sudo apt install syslog-ng-mod-http
+  sudo apt-get install syslog-ng-mod-http
   ```
 
-## Example Snippet
+## Example Generated Snippet
 
 ```conf
 @version: 3.36
 @include "scl.conf"
 
-filter f_example {
-  or(
-    netmask("10.0.0.0/8");
-    netmask("192.168.1.0/24");
+filter f_webservers { or( netmask("10.0.1.0/24"); ); };
+
+source s_webservers {
+  syslog(ip(0.0.0.0) port(10514) transport("udp"));
+};
+
+destination d_webservers {
+  http(
+    url("https://ingest.sentinelone.net/http/1234")
+    method("POST")
+    headers(
+      "Authorization: ApiKey ABCDEFG..."
+      "Content-Type: application/json"
+      "X-Sourcetype: webservers"
+    )
+    body("%MESSAGE%")
+    tls(peer-verify(optional-trust))
   );
 };
 
-source s_example {
-  syslog(ip(0.0.0.0) port(514) transport("udp"));
-};
-
-destination d_example {
-    http(
-        url("${ingest_endpoint}")
-        method("POST")
-        headers(
-            "Authorization: ApiKey ${api_key}"
-            "Content-Type: application/json"
-            "X-Sourcetype: example"
-        )
-        body("%MESSAGE%")
-        tls(peer-verify(optional-trust))
-    );
-};
-
-log {
-    source(s_example);
-    filter(f_example);
-    destination(d_example);
-};
+log { source(s_webservers); filter(f_webservers); destination(d_webservers); };
 ```
 
 ## Support
-Open a GitHub issue for questions.
+Open an Issue on GitHub or contact your internal operations/security team.
 
 ## License
 MIT

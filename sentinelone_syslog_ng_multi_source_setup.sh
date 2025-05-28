@@ -1,129 +1,164 @@
 #!/usr/bin/env bash
 # sentinelone_syslog_ng_multi_source_setup.sh
-# Version: Ubuntu Edition
-# Author: Adapted by ChatGPT
-# Description: Automates installation and configuration of syslog-ng on Ubuntu
-#              to forward logs from multiple source IP groups to a SentinelOne HTTP ingestion endpoint.
+# Version: Ubuntu Edition – Revised 2
+# Description: Installs and configures syslog-ng on Ubuntu to forward logs
+#              from multiple source IP groups—each on its own UDP port—
+#              to a SentinelOne HTTP ingestion endpoint.
 
 set -euo pipefail
 
-# Ensure running as root
+# 1. Root check
 if [[ $EUID -ne 0 ]]; then
-  echo "[ERROR] This script must be run as root." >&2
+  echo "[ERROR] Please run as root." >&2
   exit 1
 fi
 
-echo "=== SentinelOne Syslog-ng Multi-Source Setup (Ubuntu) ==="
+echo "=== SentinelOne Syslog-NG Multi-Source Setup (Ubuntu) ==="
 
-# Prompt for ingestion endpoint
-read -p "Enter SentinelOne HTTP ingestion endpoint (full URL): " ingest_endpoint
+# 2. Ingestion endpoint
+read -p "Enter full SentinelOne HTTP ingestion endpoint URL: " ingest_endpoint
 if [[ -z "$ingest_endpoint" ]]; then
-  echo "[ERROR] Ingestion endpoint cannot be empty." >&2
+  echo "[ERROR] Endpoint cannot be empty." >&2
   exit 1
 fi
 
-# Install dependencies
-echo "[INFO] Installing packages..."
-apt update
-apt install -y syslog-ng-core syslog-ng-mod-http util-linux
+# 3. Add syslog-ng OSE repo & install
+ubuntu_codename=$(lsb_release -cs)
+echo "[INFO] Adding syslog-ng OSE repository for Ubuntu ${ubuntu_codename}..."
+wget -qO - https://ose-repo.syslog-ng.com/apt/syslog-ng-ose-pub.asc | apt-key add -
+echo "deb https://ose-repo.syslog-ng.com/apt/ stable ubuntu-${ubuntu_codename}" \
+  | tee /etc/apt/sources.list.d/syslog-ng-ose.list
 
-# Configure firewall
-if command -v ufw &> /dev/null; then
-  echo "[INFO] Configuring UFW rules..."
-  ufw allow 514/udp
-  ufw allow 5514/tcp
-  ufw reload
-else
-  echo "[WARN] UFW not found; open ports 514/udp and 5514/tcp manually." >&2
-fi
+echo "[INFO] Updating package lists..."
+apt-get update
 
-# Prompt for number of source groups
+echo "[INFO] Installing syslog-ng-core, syslog-ng-scl, syslog-ng-mod-http, util-linux..."
+apt-get install -y syslog-ng-core syslog-ng-scl syslog-ng-mod-http util-linux
+
+# 4. Source-group prompts
 read -p "Enter number of source groups: " group_count
 if ! [[ "$group_count" =~ ^[1-9][0-9]*$ ]]; then
-  echo "[ERROR] Invalid number of groups." >&2
+  echo "[ERROR] Must be a positive integer." >&2
   exit 1
 fi
 
 declare -a config_blocks
+declare -a udp_ports_array
+
 for i in $(seq 1 "$group_count"); do
-  echo "---- Configuring group #$i ----"
+  echo "--- Group #$i ---"
+  # a) Name
   while true; do
-    read -p "Group name (alphanumeric & underscores only): " group_name
-    if [[ "$group_name" =~ ^[A-Za-z0-9_]+$ ]]; then
-      break
+    read -p "Group name (alnum & underscores only): " group_name
+    [[ "$group_name" =~ ^[A-Za-z0-9_]+$ ]] && break
+    echo "[ERROR] Invalid name." >&2
+  done
+
+  # b) UDP port (unique, 1–65535)
+  while true; do
+    read -p "Unique UDP port for $group_name: " udp_port
+    if [[ "$udp_port" =~ ^[0-9]+$ ]] && ((udp_port>=1 && udp_port<=65535)); then
+      port_ok=true
+      for p in "${udp_ports_array[@]}"; do
+        [[ "$p" == "$udp_port" ]] && port_ok=false
+      done
+      $port_ok && { udp_ports_array+=("$udp_port"); break; }
+      echo "[ERROR] Port $udp_port already used." >&2
     else
-      echo "[ERROR] Invalid group name." >&2
+      echo "[ERROR] Must be 1–65535." >&2
     fi
   done
 
-  read -p "Enter comma-separated IPs/CIDRs for $group_name: " ip_list
+  # c) IPs/CIDRs
+  read -p "Enter comma-separated IPs/CIDRs: " ip_list
   IFS=',' read -r -a ips <<< "$ip_list"
   filter_expr="or("
   for cidr in "${ips[@]}"; do
-    filter_expr+=" netmask(\"${cidr}\");"
+    filter_expr+=" netmask(\"$cidr\");"
   done
   filter_expr+=" )"
 
-  read -s -p "SentinelOne API key for $group_name: " api_key; echo ""
-  if [[ -z "$api_key" ]]; then
-    echo "[ERROR] API key cannot be empty." >&2
-    exit 1
-  fi
+  # d) API key
+  read -s -p "SentinelOne API key: " api_key; echo
+  [[ -n "$api_key" ]] || { echo "[ERROR] API key required." >&2; exit 1; }
 
-  read -p "Enter sourcetype/parser for $group_name: " parser_name
-  if [[ -z "$parser_name" ]]; then
-    echo "[ERROR] Sourcetype cannot be empty." >&2
-    exit 1
-  fi
+  # e) Sourcetype/parser
+  read -p "Sourcetype/parser name: " parser_name
+  [[ -n "$parser_name" ]] || { echo "[ERROR] Sourcetype required." >&2; exit 1; }
 
-  config_blocks+=( "filter f_${group_name} {
-    ${filter_expr};
-};
+  # f) Assemble config block
+  config_blocks+=( "
+filter f_${group_name} { ${filter_expr}; };
 
 source s_${group_name} {
-    syslog(ip(0.0.0.0) port(514) transport(\"udp\"));
+  syslog(ip(0.0.0.0) port(${udp_port}) transport(\"udp\"));
 };
 
 destination d_${group_name} {
-    http(
-        url(\"${ingest_endpoint}\")
-        method(\"POST\")
-        headers(
-            \"Authorization: ApiKey ${api_key}\"
-            \"Content-Type: application/json\"
-            \"X-Sourcetype: ${parser_name}\"
-        )
-        body(\"%MESSAGE%\")
-        tls(peer-verify(optional-trust))
-    );
+  http(
+    url(\"${ingest_endpoint}\")
+    method(\"POST\")
+    headers(
+      \"Authorization: ApiKey ${api_key}\"
+      \"Content-Type: application/json\"
+      \"X-Sourcetype: ${parser_name}\"
+    )
+    body(\"%MESSAGE%\")
+    tls(peer-verify(optional-trust))
+  );
 };
 
-log {
-    source(s_${group_name});
-    filter(f_${group_name});
-    destination(d_${group_name});
-};" )
+log { source(s_${group_name}); filter(f_${group_name}); destination(d_${group_name}); };
+" )
 done
 
-conf_file="/etc/syslog-ng/conf.d/sentinelone_multi_source.conf"
-if [[ -f "$conf_file" ]]; then
-  cp "$conf_file" "${conf_file}.bak.$(date +%s)"
-  echo "[INFO] Backed up existing config."
+# 5. UFW rules
+if command -v ufw &>/dev/null; then
+  echo "[INFO] Configuring UFW..."
+  for port in "${udp_ports_array[@]}"; do
+    echo "  Allowing UDP $port"
+    ufw allow "${port}/udp"
+  done
+  echo "  Allowing TCP 5514"
+  ufw allow 5514/tcp
+  ufw reload
+else
+  echo "[WARN] UFW not installed. Manually open UDP ports: ${udp_ports_array[*]} and TCP 5514." >&2
 fi
 
-cat > "$conf_file" <<EOF
-@version: 3.36
-@include "scl.conf"
+# 6. Write syslog-ng config
+conf="/etc/syslog-ng/conf.d/sentinelone_multi_source.conf"
+if [[ -f "$conf" ]]; then
+  bak="${conf}.bak.$(date +%s)"
+  cp "$conf" "$bak"
+  echo "[INFO] Backed up old config → $bak"
+fi
 
-$(printf "%s
+echo "[INFO] Writing new config to $conf..."
+{
+  echo "@version: 3.36"
+  echo "@include \"scl.conf\""
+  echo
+  for blk in "${config_blocks[@]}"; do
+    echo "$blk"
+  done
+} > "$conf"
 
-" "${config_blocks[@]}")
-EOF
+# 7. Validate & reload
+echo "[INFO] Validating syslog-ng configuration..."
+if syslog-ng --syntax-only; then
+  echo "[INFO] Syntax OK. Reloading service..."
+  if systemctl reload syslog-ng; then
+    echo "[INFO] syslog-ng reloaded."
+  else
+    echo "[INFO] Reload failed; restarting."
+    systemctl restart syslog-ng
+  fi
+else
+  echo "[ERROR] Syntax error! New config NOT applied." >&2
+  echo "[INFO] Restore previous from backup if needed." >&2
+  exit 1
+fi
 
-echo "[INFO] Restarting syslog-ng..."
-systemctl restart syslog-ng
-systemctl enable syslog-ng
-
-echo "[DONE] Setup complete."
-echo "Validate: sudo syslog-ng --syntax-only"
-echo "Logs: sudo journalctl -u syslog-ng -f"
+echo "=== Setup Complete ==="
+echo "Check live logs with: sudo journalctl -u syslog-ng -f"
